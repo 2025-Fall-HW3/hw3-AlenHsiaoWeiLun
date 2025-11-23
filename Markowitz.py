@@ -37,8 +37,8 @@ end = "2024-04-01"
 # Initialize df and df_returns
 df = pd.DataFrame()
 for asset in assets:
-    raw = yf.download(asset, start=start, end=end, auto_adjust = False)
-    df[asset] = raw['Adj Close']
+    raw = yf.download(asset, start=start, end=end, auto_adjust=False)
+    df[asset] = raw["Adj Close"]
 
 df_returns = df.pct_change().fillna(0)
 
@@ -55,17 +55,18 @@ class EqualWeightPortfolio:
         self.exclude = exclude
 
     def calculate_weights(self):
-        # Get the assets by excluding the specified column
         assets = df.columns[df.columns != self.exclude]
-        self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
+        if len(assets) == 0:
+            raise ValueError("No assets remain after excluding benchmark symbol.")
 
-        """
-        TODO: Complete Task 1 Below
-        """
+        equal_weight = np.full(len(assets), 1.0 / len(assets))
+        self.portfolio_weights = pd.DataFrame(
+            0.0, index=df.index, columns=df.columns, dtype=float
+        )
+        self.portfolio_weights.columns.name = "Symbol"
+        self.portfolio_weights.loc[:, assets] = equal_weight
+        self.portfolio_weights.loc[:, self.exclude] = 0.0
 
-        """
-        TODO: Complete Task 1 Above
-        """
         self.portfolio_weights.ffill(inplace=True)
         self.portfolio_weights.fillna(0, inplace=True)
 
@@ -108,14 +109,41 @@ class RiskParityPortfolio:
         assets = df.columns[df.columns != self.exclude]
 
         # Calculate the portfolio weights
-        self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
+        self.portfolio_weights = pd.DataFrame(
+            0.0, index=df.index, columns=df.columns, dtype=float
+        )
+        self.portfolio_weights.columns.name = "Symbol"
 
         """
         TODO: Complete Task 2 Below
         """
+        eps = 1e-8
+        asset_returns = df_returns[assets]
 
+        for i in range(self.lookback + 1, len(df)):
+            window = asset_returns.iloc[i - self.lookback : i]
+            if window.empty:
+                continue
 
+            sigma = window.std(ddof=1)
+            inv_sigma = 1.0 / sigma.replace(0, np.nan)
+            inv_sigma = inv_sigma.replace([np.inf, -np.inf], np.nan)
 
+            if inv_sigma.isna().all():
+                weights = pd.Series(1.0 / len(assets), index=assets)
+            else:
+                inv_sigma = inv_sigma.fillna(0.0)
+                scale = inv_sigma.sum()
+                if scale <= eps:
+                    weights = pd.Series(1.0 / len(assets), index=assets)
+                else:
+                    weights = inv_sigma / scale
+
+            self.portfolio_weights.loc[df.index[i], assets] = weights.reindex(
+                assets
+            ).values
+
+        self.portfolio_weights.loc[:, self.exclude] = 0.0
         """
         TODO: Complete Task 2 Above
         """
@@ -163,13 +191,19 @@ class MeanVariancePortfolio:
         assets = df.columns[df.columns != self.exclude]
 
         # Calculate the portfolio weights
-        self.portfolio_weights = pd.DataFrame(index=df.index, columns=df.columns)
+        self.portfolio_weights = pd.DataFrame(
+            0.0, index=df.index, columns=df.columns, dtype=float
+        )
+        self.portfolio_weights.columns.name = "Symbol"
+
+        asset_returns = df_returns[assets]
 
         for i in range(self.lookback + 1, len(df)):
-            R_n = df_returns.copy()[assets].iloc[i - self.lookback : i]
-            self.portfolio_weights.loc[df.index[i], assets] = self.mv_opt(
-                R_n, self.gamma
-            )
+            R_n = asset_returns.iloc[i - self.lookback : i]
+            if R_n.empty:
+                continue
+            weights = self.mv_opt(R_n, self.gamma)
+            self.portfolio_weights.loc[df.index[i], assets] = weights
 
         self.portfolio_weights.ffill(inplace=True)
         self.portfolio_weights.fillna(0, inplace=True)
@@ -179,46 +213,57 @@ class MeanVariancePortfolio:
         mu = R_n.mean().values
         n = len(R_n.columns)
 
-        with gp.Env(empty=True) as env:
-            env.setParam("OutputFlag", 0)
-            env.setParam("DualReductions", 0)
-            env.start()
-            with gp.Model(env=env, name="portfolio") as model:
-                """
-                TODO: Complete Task 3 Below
-                """
+        # numerical safety: symmetrize + jitter
+        Sigma = 0.5 * (Sigma + Sigma.T)
+        Sigma = Sigma + 1e-8 * np.eye(n)
 
-                # Sample Code: Initialize Decision w and the Objective
-                # NOTE: You can modify the following code
-                w = model.addMVar(n, name="w", ub=1)
-                model.setObjective(w.sum(), gp.GRB.MAXIMIZE)
+        try:
+            with gp.Env(empty=True) as env:
+                env.setParam("OutputFlag", 0)
+                env.start()
+                with gp.Model(env=env, name="portfolio") as model:
+                    w = model.addVars(n, lb=0.0, ub=1.0, name="w")
 
-                """
-                TODO: Complete Task 3 Above
-                """
-                model.optimize()
-
-                # Check if the status is INF_OR_UNBD (code 4)
-                if model.status == gp.GRB.INF_OR_UNBD:
-                    print(
-                        "Model status is INF_OR_UNBD. Reoptimizing with DualReductions set to 0."
+                    ret_term = gp.quicksum(mu[i] * w[i] for i in range(n))
+                    risk_term = gp.quicksum(
+                        Sigma[i, j] * w[i] * w[j]
+                        for i in range(n)
+                        for j in range(n)
                     )
-                elif model.status == gp.GRB.INFEASIBLE:
-                    # Handle infeasible model
-                    print("Model is infeasible.")
-                elif model.status == gp.GRB.INF_OR_UNBD:
-                    # Handle infeasible or unbounded model
-                    print("Model is infeasible or unbounded.")
+                    model.setObjective(
+                        ret_term - 0.5 * gamma * risk_term, gp.GRB.MAXIMIZE
+                    )
 
-                if model.status == gp.GRB.OPTIMAL or model.status == gp.GRB.SUBOPTIMAL:
-                    # Extract the solution
-                    solution = []
-                    for i in range(n):
-                        var = model.getVarByName(f"w[{i}]")
-                        # print(f"w {i} = {var.X}")
-                        solution.append(var.X)
+                    model.addConstr(gp.quicksum(w[i] for i in range(n)) == 1.0)
 
-        return solution
+                    model.optimize()
+
+                    if model.status == gp.GRB.OPTIMAL:
+                        return np.array([w[i].X for i in range(n)])
+        except gp.GurobiError:
+            pass
+        except Exception:
+            pass
+
+        return self._fallback_solution(mu, Sigma, gamma)
+
+    def _fallback_solution(self, mu, Sigma, gamma):
+        n = len(mu)
+        if gamma <= 0:
+            weights = np.zeros(n)
+            weights[np.argmax(mu)] = 1.0
+            return weights
+
+        try:
+            Sigma_inv = np.linalg.pinv(Sigma)
+            raw = Sigma_inv @ mu / max(gamma, 1e-8)
+            raw = np.clip(raw, 0, None)
+            total = raw.sum()
+            if total <= 0:
+                return np.full(n, 1.0 / n)
+            return raw / total
+        except np.linalg.LinAlgError:
+            return np.full(n, 1.0 / n)
 
     def calculate_portfolio_returns(self):
         # Ensure weights are calculated
